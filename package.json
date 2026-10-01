@@ -1,0 +1,59 @@
+{
+  "name": "pi-whatsapp",
+  "version": "0.1.0",
+  "description": "WhatsApp for pi: message your agent from your phone, over Meta's official WhatsApp Agent Platform.",
+  "license": "MIT",
+  "author": "Abuzar Khan",
+  "type": "module",
+  "private": true,
+  "keywords": [
+    "pi",
+    "pi-extension",
+    "whatsapp",
+    "agent",
+    "meta",
+    "ai"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/abuzarai/pi-whatsapp.git"
+  },
+  "bugs": {
+    "url": "https://github.com/abuzarai/pi-whatsapp/issues"
+  },
+  "homepage": "https://github.com/abuzarai/pi-whatsapp#readme",
+  "engines": {
+    "node": ">=20.3.0"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "files": [
+    "*.ts",
+    "README.md",
+    "LICENSE",
+    "whatsapp-agent.service"
+  ],
+  "scripts": {
+    "test": "node --test test/whatsapp.test.mjs",
+    "test:semantics": "node --test test/pi-semantics.test.mjs",
+    "test:all": "node --test test/*.test.mjs"
+  },
+  "devDependencies": {
+    "jiti": "^2.7.0"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-ai": {
+      "optional": true
+    },
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    }
+  }
+}

@@ -1,0 +1,12 @@
+node_modules/
+
+# Runtime state, if the extension is ever run from this checkout.
+.wa-inbox/
+whatsapp-agent.json
+whatsapp-agent-state.json
+whatsapp-agent.lock
+whatsapp-agent.env
+.pi/
+
+*.log
+.DS_Store

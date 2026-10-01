@@ -1,0 +1,38 @@
+# Headless WhatsApp agent: run the extension with no pi session open.
+#
+# Install:
+#   cp whatsapp-agent.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now whatsapp-agent
+#   journalctl --user -u whatsapp-agent -f
+#
+# Keep it running when you are not logged in:
+#   loginctl enable-linger $USER
+#
+# ## Why `sleep infinity |` is there
+#
+# pi treats stdin EOF as a request to shut down, and systemd's default
+# StandardInput=null closes stdin immediately — so `pi --mode rpc --whatsapp`
+# exits after about three seconds. The pipe holds stdin open forever, which is
+# all that is needed to keep the listener alive.
+
+[Unit]
+Description=WhatsApp agent (pi extension host)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Replace the pi path with the output of `command -v pi`. systemd's PATH is
+# minimal and will not include a user-local install.
+ExecStart=/bin/sh -c 'sleep infinity | exec %h/.pi/agent/bin/pi --mode rpc --no-session --whatsapp'
+Restart=always
+RestartSec=5
+SyslogIdentifier=wa-agent
+
+# Optional: credentials and tuning. Anything you would pass as an environment
+# variable can go in this file, one KEY=value per line.
+#EnvironmentFile=-%h/.pi/agent/whatsapp.env
+
+[Install]
+WantedBy=default.target
