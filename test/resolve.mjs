@@ -6,7 +6,7 @@
  */
 
 import { execFileSync } from "node:child_process";
-import { existsSync, readdirSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import { createRequire } from "node:module";
@@ -47,8 +47,14 @@ function candidateRoots() {
   if (path.isAbsolute(bin)) {
     // The managed layout is <agent-dir>/bin/pi with releases under
     // <agent-dir>/install/releases/<version>/node_modules.
-    const agentDir = path.resolve(path.dirname(bin), "..");
+    // PATH may expose ~/.local/bin/pi as a symlink to the managed launcher.
+    const resolvedBin = existsSync(bin) ? realpathSync(bin) : bin;
+    const agentDir = path.resolve(path.dirname(resolvedBin), "..");
     const releases = path.join(agentDir, "install", "releases");
+    const current = path.join(agentDir, "install", "current-version");
+    if (existsSync(current)) {
+      roots.push(path.join(releases, readFileSync(current, "utf8").trim(), "node_modules"));
+    }
     if (existsSync(releases)) {
       for (const version of readdirSync(releases)) {
         roots.push(path.join(releases, version, "node_modules"));
@@ -59,6 +65,28 @@ function candidateRoots() {
 
   roots.push(path.join(homedir(), ".pi", "agent", "npm", "node_modules"));
   return roots;
+}
+
+/** Installed Pi package entry point for isolated registration/SDK tests. */
+export function findPiPackage(name) {
+  try {
+    return require.resolve(name);
+  } catch {
+    for (const root of candidateRoots()) {
+      try {
+        return require.resolve(name, { paths: [root] });
+      } catch {
+        // Pi's public entry can be import-only, which require.resolve rejects.
+        const manifest = path.join(root, name, "package.json");
+        if (existsSync(manifest)) {
+          const pkg = JSON.parse(readFileSync(manifest, "utf8"));
+          const entry = path.resolve(path.dirname(manifest), pkg.main ?? "index.js");
+          if (existsSync(entry)) return entry;
+        }
+      }
+    }
+  }
+  throw new Error(`Cannot find ${name}; set PI_ROOT to pi's node_modules directory. Searched: ${candidateRoots().join(", ")} (pi: ${findPiBin()})`);
 }
 
 /** The pi binary: from the environment, or resolved from PATH. */

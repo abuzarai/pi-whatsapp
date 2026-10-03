@@ -19,6 +19,7 @@ import path from "node:path";
 import { Type } from "@earendil-works/pi-ai";
 import {
   defineTool,
+  type AgentToolResult,
   type ExtensionAPI,
   type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
@@ -26,6 +27,7 @@ import {
 import { WhatsAppClient, WA_BASE, type WaMessage } from "./client.ts";
 import { formatReport, runDoctor } from "./doctor.ts";
 import { buildAttachmentPrompt } from "./media.ts";
+import { classifyOutboundFile, normalizeMediaOptions, readOutboundFile } from "./outbound-media.ts";
 import { agentDir, defaultWorkspace, ensureWorkspace } from "./persona.ts";
 import { runPi } from "./runner.ts";
 import {
@@ -675,7 +677,7 @@ export default function whatsappExtension(pi: ExtensionAPI) {
       name: "whatsapp_send",
       label: "WhatsApp Send",
       description:
-        'Send the user a WhatsApp message. Use it whenever the user asks to be messaged, pinged, texted, or notified — phrasings like "whatsapp me this", "send me a summary", or "let me know when it finishes". Compose the body yourself, and keep it concise and plain-text because it arrives as a phone notification. Only the user who created the agent is reachable.',
+        'Send the user a WhatsApp message. Use it whenever the user asks to be messaged, pinged, texted, or notified — phrasings like "whatsapp me this", "send me a summary", or "let me know when it finishes". Compose the body yourself, and keep it concise and plain-text because it arrives as a phone notification. Only the user who created the agent is reachable. For files, use whatsapp_send_file.',
       promptSnippet: 'Message the user on WhatsApp ("whatsapp me …")',
       parameters: Type.Object({
         text: Type.String({ description: "Message body, up to 4096 characters" }),
@@ -687,7 +689,7 @@ export default function whatsappExtension(pi: ExtensionAPI) {
         ),
       }),
       annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
-      async execute(_id, params, signal) {
+      async execute(_id, params, signal): Promise<AgentToolResult<{ to: string; error?: string; characters?: number } | undefined>> {
         const token = await loadToken(CONFIG_PATH);
         if (!token) {
           return {
@@ -725,6 +727,80 @@ export default function whatsappExtension(pi: ExtensionAPI) {
           content: [{ type: "text" as const, text: `Sent ${params.text.length} characters to WhatsApp` }],
           details: { to, characters: params.text.length },
         };
+      },
+    }),
+  );
+
+  pi.registerTool(
+    defineTool({
+      name: "whatsapp_send_file",
+      label: "WhatsApp Send File",
+      description:
+        "Send a local file — image, video, audio, document or sticker — to the user's WhatsApp. Use this instead of whatsapp_send for attachments. Paths are absolute or relative to the current session's working directory. Captions are supported only for images, videos and documents; filename is a document display rename only. Only the agent's creator is reachable.",
+      promptSnippet: "Send a local file to the user on WhatsApp",
+      parameters: Type.Object({
+        path: Type.String({ minLength: 1, description: "Local file path, absolute or relative to this session's cwd" }),
+        caption: Type.Optional(Type.String({ maxLength: 1024, description: "Caption for image/video/document, up to 1024 characters" })),
+        filename: Type.Optional(Type.String({ minLength: 1, description: "Document display name, including extension; not a path" })),
+      }),
+      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
+      async execute(_id, params, signal, _onUpdate, ctx) {
+        const token = await loadToken(CONFIG_PATH);
+        if (!token) {
+          return {
+            content: [{ type: "text" as const, text: `No WhatsApp API token in ${CONFIG_PATH}` }],
+            details: undefined,
+            isError: true,
+          };
+        }
+        const to = await currentCreator();
+        if (!to) {
+          return {
+            content: [{ type: "text" as const, text: "No recipient known yet. The agent learns the conversation id after the user sends it a WhatsApp message." }],
+            details: undefined,
+            isError: true,
+          };
+        }
+
+        let stage: "file" | "upload" | "send" = "file";
+        try {
+          const filePath = path.resolve(ctx.cwd, params.path);
+          const plan = classifyOutboundFile(filePath);
+          const opts = normalizeMediaOptions(plan.type, {
+            caption: params.caption,
+            filename: params.filename ?? (plan.type === "document" ? path.basename(filePath) : undefined),
+          });
+          if (plan.type === "document" && params.filename !== undefined && path.extname(filePath).length > 1 && path.extname(params.filename.trim()).length <= 1) {
+            throw new Error("Document display name must include a file extension; keep the original extension in the name.");
+          }
+          const bytes = await readOutboundFile(filePath, plan.maxBytes, signal);
+          const client = new WhatsAppClient(token);
+          stage = "upload";
+          const { id } = await client.uploadMedia(bytes, plan.mimeType, signal);
+          stage = "send";
+          if (signal?.aborted) throw new DOMException("File sending cancelled.", "AbortError");
+          const sent = await client.sendMedia(to, plan.type, id, opts, signal);
+          if (!sent.ok) throw new Error(sent.error === "aborted" ? "File sending cancelled." : sent.error);
+          stats.sent++;
+          paint();
+          return {
+            content: [{ type: "text" as const, text: `WhatsApp accepted the ${plan.type} message (${bytes.length} bytes).` }],
+            details: { to, type: plan.type, bytes: bytes.length, mediaId: id },
+          };
+        } catch (err) {
+          const code = (err as NodeJS.ErrnoException)?.code;
+          const detail = code === "ENOENT" ? "File not found."
+            : code === "EACCES" || code === "EPERM" ? "File is not readable."
+            : err instanceof Error && err.name === "AbortError" ? "File sending cancelled."
+            : err instanceof Error ? err.message : "File sending failed.";
+          // Paths and local names are user-controlled too; keep result text printable.
+          const error = detail.replace(/[\u0000-\u001f\u007f-\u009f]/g, " ").slice(0, 500);
+          return {
+            content: [{ type: "text" as const, text: `WhatsApp file ${stage} failed: ${error}` }],
+            details: { to, stage, error },
+            isError: true,
+          };
+        }
       },
     }),
   );

@@ -5,6 +5,8 @@
  * https://www.whatsapp.com/developer/WhatsApp-Agent-Platform-Developer-Manual.pdf
  */
 
+import { setTimeout as delay } from "node:timers/promises";
+import { normalizeMediaOptions, type MediaOptions, type OutboundMediaType } from "./outbound-media.ts";
 import { isSafeMediaId, sleep } from "./util.ts";
 
 export const WA_BASE = process.env.WA_BASE_URL ?? "https://api.whatsapp.com/agent/v1";
@@ -105,6 +107,41 @@ export function describeError(status: number, code?: number): string {
   if (status === 409) return "Another poll replaced this one. Only one poll may run per agent.";
   if (status >= 500) return "Server error. Retry with exponential backoff.";
   return "Unexpected response.";
+}
+
+function retryable(status: number, code?: number): boolean {
+  return status === 429 || status >= 500 || code === 131016;
+}
+
+/** Media errors must distinguish upload rejection from an expired send ID. */
+function describeMediaError(stage: "upload" | "send", status: number, code?: number): string {
+  if (stage === "upload" && code === 131053) {
+    return "Media rejected at upload: over the size limit, unsupported MIME type, or invalid media format.";
+  }
+  if (stage === "send" && code === 131009) {
+    return "Media could not be sent: the ID may be unknown or expired, or the media fields/type/size are invalid.";
+  }
+  if (code === 100) return "Invalid request: check the token, media ID and caption length.";
+  return describeError(status, code);
+}
+
+export class MediaApiError extends Error {
+  constructor(
+    readonly stage: "upload" | "send",
+    readonly status: number,
+    readonly code?: number,
+    detail = describeMediaError(stage, status, code),
+  ) {
+    super(`${status}${code === undefined ? "" : ` / ${code}`}: ${detail}`);
+    this.name = "MediaApiError";
+  }
+}
+
+interface MessagePostResult {
+  ok: boolean;
+  error?: string;
+  status?: number;
+  code?: number;
 }
 
 export class WhatsAppClient {
@@ -208,45 +245,121 @@ export class WhatsAppClient {
     body: string,
     signal?: AbortSignal,
   ): Promise<{ ok: boolean; error?: string }> {
-    let lastError = "unknown error";
+    const result = await this.postWithRetry({ messaging_product: "whatsapp", to, type: "text", text: { body } }, signal);
+    // Keep the existing text surface, including its original peer error string.
+    return result.ok ? { ok: true } : { ok: false, error: result.error };
+  }
 
+  private async postWithRetry(payload: object, signal?: AbortSignal, media = false): Promise<MessagePostResult> {
+    let last: MessagePostResult = { ok: false, error: "unknown error" };
     for (let attempt = 0; attempt < 4; attempt++) {
+      if (media && signal?.aborted) return { ok: false, error: "aborted" };
       let res: Response;
       try {
         res = await this.request(
           `${WA_BASE}/messages`,
-          {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              messaging_product: "whatsapp",
-              to,
-              type: "text",
-              text: { body },
-            }),
-          },
+          { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) },
           30_000,
           signal,
         );
       } catch (err) {
-        if (err instanceof Error && err.name === "AbortError") return { ok: false, error: "aborted" };
-        lastError = err instanceof Error ? err.message : String(err);
+        if ((media && signal?.aborted) || (err instanceof Error && err.name === "AbortError")) {
+          return { ok: false, error: "aborted" };
+        }
+        last = { ok: false, error: err instanceof Error ? err.message : String(err) };
+        // Deliberately retain text's final network-failure sleep and non-abortable backoff.
         await sleep(1500 * 2 ** attempt);
         continue;
       }
-
       if (res.ok) return { ok: true };
-
       const parsed = parseApiError(res.status, await res.text().catch(() => ""));
-      lastError = `${res.status}: ${parsed.detail}`;
-      // 131016 (not accepted for delivery) is retryable even when the status is
-      // not 5xx, as the manual documents.
-      const retryable = res.status === 429 || res.status >= 500 || parsed.code === 131016;
-      if (!retryable) return { ok: false, error: lastError };
+      last = { ok: false, error: `${res.status}: ${parsed.detail}`, status: res.status, code: parsed.code };
+      if (!retryable(res.status, parsed.code)) return last;
       if (attempt < 3) await sleep(1500 * 2 ** attempt);
     }
+    return last;
+  }
 
-    return { ok: false, error: lastError };
+  /** Upload once; message retries reuse this ID rather than creating more uploads. */
+  async uploadMedia(bytes: Buffer, mimeType: string, signal?: AbortSignal): Promise<{ id: string }> {
+    const form = new FormData();
+    form.append("messaging_product", "whatsapp");
+    form.append("type", mimeType);
+    form.append("file", new Blob([new Uint8Array(bytes)], { type: mimeType }), "file");
+    let last = new MediaApiError("upload", 0);
+
+    for (let attempt = 0; attempt < 4; attempt++) {
+      if (signal?.aborted) throw new DOMException("Upload cancelled.", "AbortError");
+      let res: Response | undefined;
+      try {
+        // Fetch must supply its own multipart boundary, not a hand-written Content-Type.
+        res = await this.request(`${WA_BASE}/media`, { method: "POST", body: form }, 30_000, signal);
+      } catch {
+        if (signal?.aborted) throw new DOMException("Upload cancelled.", "AbortError");
+        last = new MediaApiError("upload", 0);
+      }
+      if (res) {
+        if (signal?.aborted) throw new DOMException("Upload cancelled.", "AbortError");
+        if (res.ok) {
+          let body: unknown;
+          try {
+            body = await res.json();
+          } catch (err) {
+            if (signal?.aborted) throw new DOMException("Upload cancelled.", "AbortError");
+            if (err instanceof SyntaxError) {
+              throw new MediaApiError("upload", res.status, undefined, "Upload response was not valid JSON.");
+            }
+            // Receiving headers isn't enough: the body can still time out or disconnect.
+            last = new MediaApiError("upload", 0);
+            if (attempt < 3) await delay(1500 * 2 ** attempt, undefined, { signal });
+            continue;
+          }
+          if (signal?.aborted) throw new DOMException("Upload cancelled.", "AbortError");
+          const id = (body as { id?: unknown } | null)?.id;
+          if (typeof id !== "string" || !id.trim()) {
+            throw new MediaApiError("upload", res.status, undefined, "Upload response did not contain a non-empty media ID.");
+          }
+          return { id };
+        }
+        let errorBody: string;
+        try {
+          errorBody = await res.text();
+        } catch {
+          if (signal?.aborted) throw new DOMException("Upload cancelled.", "AbortError");
+          // A cut-off body can hide 131016 even behind a 400; this is a transport failure.
+          last = new MediaApiError("upload", res.status, undefined, "Upload error response body could not be read (connection failure or timeout).");
+          if (attempt < 3) await delay(1500 * 2 ** attempt, undefined, { signal });
+          continue;
+        }
+        const parsed = parseApiError(res.status, errorBody);
+        last = new MediaApiError("upload", res.status, parsed.code);
+        if (signal?.aborted) throw new DOMException("Upload cancelled.", "AbortError");
+        if (!retryable(res.status, parsed.code)) throw last;
+      }
+      if (attempt < 3) await delay(1500 * 2 ** attempt, undefined, { signal });
+    }
+    throw last;
+  }
+
+  async sendMedia(
+    to: string,
+    type: OutboundMediaType,
+    mediaId: string,
+    opts: MediaOptions = {},
+    signal?: AbortSignal,
+  ): Promise<{ ok: boolean; error?: string }> {
+    let fields: MediaOptions;
+    try {
+      fields = normalizeMediaOptions(type, opts);
+      if (typeof mediaId !== "string" || !mediaId.trim()) throw new Error("A non-empty media ID is required.");
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : "Invalid media options." };
+    }
+    const result = await this.postWithRetry({ messaging_product: "whatsapp", to, type, [type]: { id: mediaId, ...fields } }, signal, true);
+    if (result.ok) return { ok: true };
+    if (result.error === "aborted") return { ok: false, error: "aborted" };
+    // Don't expose untrusted peer text or misdiagnose code 100 as always a bad token.
+    return { ok: false, error: new MediaApiError("send", result.status ?? 0, result.code).message };
   }
 
   /**

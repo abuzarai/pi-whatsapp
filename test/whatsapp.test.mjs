@@ -21,6 +21,7 @@ import path from "node:path";
 import { createRequire } from "node:module";
 
 import { findJiti, findPiBin } from "./resolve.mjs";
+import { registerOutboundTests } from "./outbound-tests.mjs";
 
 const require = createRequire(import.meta.url);
 
@@ -72,8 +73,11 @@ process.stdout.write("stub reply");
 }
 
 /** Minimal stand-in for the WhatsApp Agent Platform. */
-function startMockServer({ messages, updatesError, sendError, mediaUrl, alwaysEmpty, conflicts }) {
-  const received = { sends: [], statuses: [], polls: 0, mediaMeta: 0, mediaFetches: 0, sendAttempts: 0 };
+function startMockServer({ messages, updatesError, sendError, uploadError, uploadResponse, mediaUrl, alwaysEmpty, conflicts }) {
+  const received = {
+    sends: [], statuses: [], polls: 0, mediaMeta: 0, mediaFetches: 0, sendAttempts: 0,
+    uploads: [], uploadAttempts: 0, events: [],
+  };
   let served = 0;
   let conflictCount = 0;
 
@@ -142,12 +146,32 @@ function startMockServer({ messages, updatesError, sendError, mediaUrl, alwaysEm
       return;
     }
 
+    if (req.method === "POST" && url.pathname.endsWith("/agent/v1/media")) {
+      const chunks = [];
+      req.on("data", (d) => chunks.push(d));
+      req.on("end", () => {
+        received.uploadAttempts++;
+        received.events.push("upload");
+        received.uploads.push({ headers: req.headers, body: Buffer.concat(chunks) });
+        if (uploadError && (uploadError.times === undefined || received.uploadAttempts <= uploadError.times)) {
+          return json(uploadError.status, uploadError.body);
+        }
+        if (typeof uploadResponse === "string") {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          return res.end(uploadResponse);
+        }
+        json(200, uploadResponse ?? { id: "media-upload-1" });
+      });
+      return;
+    }
+
     if (req.method === "POST" && url.pathname.endsWith("/agent/v1/messages")) {
       let body = "";
       req.on("data", (d) => (body += d));
       req.on("end", () => {
         const parsed = JSON.parse(body);
         received.sendAttempts++;
+        received.events.push("message");
         if (sendError && (sendError.times === undefined || received.sendAttempts <= sendError.times)) {
           // A string body is sent raw, so a test can place a marker at the very
           // start of the peer-controlled error text.
@@ -261,6 +285,8 @@ async function fixture(messages, mockOptions = {}) {
     },
   };
 }
+
+registerOutboundTests({ createJiti, EXT_DIR, startMockServer, fixture, startPi, stopPi, waitFor });
 
 // --------------------------------------------------------- unit: util, runner
 

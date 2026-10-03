@@ -137,18 +137,21 @@ sending will tell you so.
 | `/whatsapp forget all` | Forget every WhatsApp conversation |
 | `/whatsapp forget media` | Delete every downloaded attachment |
 
-Two tools are available to the model in **every** pi session:
+Three tools are registered when the extension loads. They are available to the
+model only when that session's tool allowlist includes them:
 
 | Tool | What it does |
 |---|---|
 | `whatsapp_send` | Message you |
+| `whatsapp_send_file` | Send a local file to you |
 | `whatsapp_status` | Report the listener's state |
 
 ---
 
 ## Sending from any session
 
-You do **not** need to be listening to send. In any ordinary pi session:
+You do **not** need to be listening to send. In an ordinary pi session with the
+extension enabled and its send tool allowed:
 
 ```
 whatsapp me these details concisely
@@ -165,6 +168,87 @@ Run the full test suite, then WhatsApp me the summary and any failures.
 
 Use plain language for that — pi writes the message. `/whatsapp send <text>` is a
 command that sends your text **verbatim**, so it does not summarise anything.
+
+## Sending files back
+
+Ask pi to send a local file:
+
+```
+Send ./reports/summary.pdf to my WhatsApp with the caption "Test results".
+```
+
+The `whatsapp_send_file` tool uploads the bytes, then sends a message using the
+returned media ID. It sends only to the remembered creator. Paths can be absolute
+or relative to the invoking session's working directory, not necessarily
+`WA_PI_CWD`. Regular files and symlinks to regular files are supported; directories
+and special files are rejected. Nothing from the inbox is automatically forwarded.
+
+| Kind | Supported formats | Local size cap |
+|---|---|---|
+| Image | JPEG, PNG | 5,000,000 bytes (5 MB) |
+| Video | MP4, 3GPP | 16,000,000 bytes (16 MB) |
+| Audio | AAC, m4a, MP3, AMR-NB, Opus-in-Ogg, .opus | 16,000,000 bytes (16 MB) |
+| Document | PDF, TXT, doc/docx, xls/xlsx, ppt/pptx; unknown extensions as generic binary | 16,000,000 bytes (16 MB) |
+| Sticker | WebP | 500,000 bytes (500 KB) |
+
+We use conservative decimal caps because the manual does not define MB/KB byte
+multipliers. We check size and bound the read before uploading. A file extension
+selects the upload type; a document display rename does not change it. `.opus`
+uploads use `audio/opus`. Unknown extensions use `application/octet-stream`, not
+an unsupported declared MIME type.
+
+Images must be 8-bit RGB/RGBA and at most 25 megapixels. Video must use H.264 and
+AAC; Ogg audio must contain mono Opus. Stickers must fit within 4096×4096 pixels.
+The extension does not transcode or inspect these profiles; WhatsApp can reject
+an incorrectly encoded file even when it fits the size cap.
+
+Captions are allowed only on images, videos and documents, up to 1024 characters.
+The tool schema limits input; direct client calls cap captions without splitting
+Unicode characters. `filename` is a document-only display name, including its
+extension. It defaults to the original basename. If the source document has an
+extension, an explicit rename must also include an extension; `report.pdf` cannot
+be renamed to just `report`. Genuinely extensionless generic files may keep an
+extensionless display name. Empty names, path separators and control characters
+are rejected. Unsupported caption/filename options fail before upload rather
+than being silently dropped.
+
+### Sending from the phone agent
+
+Default phone children have only `read,grep,find,ls`; registering the tool does
+not enable it there. To opt in, start the listener with:
+
+```bash
+WA_PI_TOOLS="read,grep,find,ls,whatsapp_send_file" pi --whatsapp
+```
+
+Keep the extension enabled in the child's agent directory and save a usable token
+in `whatsapp-agent.json` (or `WA_CONFIG`). The parent deliberately removes
+`WHATSAPP_AGENT_TOKEN` from child environments. An environment-only setup can
+receive messages and send final text through the parent, but cannot authenticate
+the child's file tool. Adding the tool to the allowlist does not restore that
+token. This opt-in was checked against Pi 1.0.0; other versions may differ.
+
+Giving the phone agent this tool lets it upload files it can read. Removing the
+environment token is not a filesystem sandbox: same-user children can still read
+accessible config files. The default tool list and credential stripping remain
+unchanged. A successful file send does not suppress the normal final text reply.
+
+### Retries and failures
+
+WhatsApp has separate rolling 60-second counters of 12 requests for messages,
+statuses and each media method. We retry transient failures with backoff, but
+have no local queue; retries can exhaust before the window resets.
+
+A timeout, connection reset or server error can leave delivery unknown. A retry
+can send a duplicate. Message retries reuse the uploaded ID, not a fresh upload.
+Upload or send failures are reported separately. Unused uploads are not deleted
+automatically; the platform documents 30-day expiry.
+
+Upload cancellation interrupts its retry wait. Message retry waits retain the
+existing text-send behavior and are not immediately interruptible. A cancelled
+upload never proceeds to sending. Success means the message API accepted the
+request, not that the recipient received or could open it. Real arrival and
+playability still need a separate live check.
 
 ## Listening
 
@@ -268,7 +352,9 @@ Start with `/whatsapp doctor`.
 | Footer shows nothing | Not listening. Start with `pi --whatsapp` or `/whatsapp connect` |
 | `whatsapp: another poller is running` | Another session or the service holds the lock |
 | `No recipient yet` | Nothing has been received yet — message the agent from your phone |
-| `HTTP 400 / code 100` | The key is present but invalid. Regenerate it in WhatsApp |
+| `HTTP 400 / code 100` | Check the token, media ID or text/caption length; the code is not token-specific |
+| Upload fails with `400 / 131053` | Size, MIME type or media format rejected |
+| File send fails with `400 / 131009` | Unknown/expired media ID or invalid media fields/type/size |
 | `HTTP 401 / code 190` | The `Authorization` header was rejected |
 | Sending fails with `403 / 131005` | The recipient is not the agent's creator |
 | Nothing arrives at all | Check **Settings → Agents** exists; you may be outside the rollout |
@@ -285,7 +371,7 @@ short reason if something is wrong.
 - **Not end-to-end encrypted.**
 - **Up to 5 agents** per WhatsApp account.
 - **Audio is not transcribed.** The agent is told it cannot hear voice notes.
-- **Rate limits** per agent: 12 sends/min, 12 read receipts/min, 15 polls/min.
+- **Rate limits** per agent: 12 sends/min, 12 read receipts/min, 12 requests/min for each media method, 15 polls/min.
 - **One poller per agent** — see above.
 - **Messages are capped at 4096 characters**; longer replies are split.
 
@@ -298,7 +384,7 @@ without installing it, with `pi -e .` from the repo root.
 
 ```bash
 npm install             # one devDependency (jiti)
-npm test                # 46 hermetic tests — mock platform, stub pi, real pi in RPC mode
+npm test                # hermetic tests — mock platform, direct tools, stub pi, real pi in RPC mode
 npm run test:semantics  # 4 tests that spawn real pi with real model calls
 npm run test:all        # both
 ```
@@ -308,7 +394,8 @@ pi's own install, and `PI_BIN` / `PI_ROOT` / `PI_JITI_PATH` override the lookup 
 pi lives somewhere unusual.
 
 The hermetic suite covers the full inbound → child pi → reply path against a mock
-platform, the state file, the lock, media permissions, and error rendering. The
+platform, outbound multipart uploads and registered file-tool callbacks, child
+tool opt-in, the state file, the lock, media permissions, and error rendering. The
 semantics suite exists because some bugs are invisible to mocks: a stub `pi`
 accepts any arguments, so only the real binary can verify that `@path` attachment
 parsing works. It skips itself when no model is authenticated.
@@ -321,6 +408,7 @@ Architecture, in one line each:
 | `client.ts` | WhatsApp Agent Platform HTTP client |
 | `doctor.ts` | The `/whatsapp doctor` checks |
 | `media.ts` | Building the child prompt for an attachment |
+| `outbound-media.ts` | Outbound type/option policy and bounded local file reads |
 | `persona.ts` | Workspace location and the default `AGENTS.md` |
 | `runner.ts` | Spawning the child pi |
 | `sessions.ts` | Locating and deleting transcripts and attachments |

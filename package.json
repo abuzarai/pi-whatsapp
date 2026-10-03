@@ -1,6 +1,6 @@
 {
   "name": "pi-whatsapp",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "WhatsApp for pi: message your agent from your phone, over Meta's official WhatsApp Agent Platform.",
   "license": "MIT",
   "author": "Abuzar Khan",
